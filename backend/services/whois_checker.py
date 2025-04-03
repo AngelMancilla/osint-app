@@ -2,26 +2,23 @@ import whois
 import socket
 import ipaddress
 import requests
+import json
+import os
+from datetime import datetime
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
+VT_API_KEY = os.getenv("VT_API_KEY", "c2337922306e40e9c5701d839ec5a54e9480107b8fbfc90ead2969de62a7d3f3")
+
 
 def is_ip(ip):
-    """Check if the given string is a valid IP address."""
     try:
         return bool(ipaddress.ip_address(ip))
     except ValueError:
         return False
 
 
-def is_url(url):
-    """Check if the given string is a valid URL (must include a scheme)."""
-    parsed = urlparse(url)
-    return bool(parsed.scheme and parsed.netloc)
-
-
 def is_domain(domain):
-    """Check if the given string is a valid domain name."""
     try:
         socket.gethostbyname(domain)
         return True
@@ -30,39 +27,32 @@ def is_domain(domain):
 
 
 def extract_domain(entry):
-    """Extract the domain name from a URL or return the input if it's already a domain."""
     parsed = urlparse(entry)
     return parsed.netloc if parsed.netloc else entry
 
 
 def clean_whois_data(data):
-    """Filter and clean WHOIS data, keeping only relevant OSINT information."""
-
     def get_first(value):
-        return value[0] if isinstance(value, list) and value else value or "Not available"
+        if isinstance(value, list) and value:
+            value = value[0]
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d %H:%M:%S")
+        return value or "Not available"
 
     return {
         "domain_name": get_first(data.get("domain_name")),
         "registrar": get_first(data.get("registrar")),
-        "whois_server": get_first(data.get("whois_server")),
         "creation_date": get_first(data.get("creation_date")),
         "expiration_date": get_first(data.get("expiration_date")),
-        "updated_date": get_first(data.get("updated_date")),
-        "name_servers": data.get("name_servers", "Not available"),
-        "status": data.get("status", "Not available"),
         "emails": get_first(data.get("emails")),
         "organization": get_first(data.get("org")),
-        "address": get_first(data.get("address")),
-        "city": get_first(data.get("city")),
-        "state": get_first(data.get("state")),
         "country": get_first(data.get("country")),
     }
 
 
 def whois_check(arg):
-    """Perform a WHOIS lookup on a valid domain or IP address."""
-    if not is_domain(arg) and not is_ip(arg):
-        return {"error": "Invalid argument."}
+    if not is_domain(arg):
+        return {"error": "Invalid domain."}
     try:
         target = extract_domain(arg)
         whois_data = whois.whois(target)
@@ -71,18 +61,49 @@ def whois_check(arg):
         return {"error": f"WHOIS lookup failed: {e}"}
 
 
+def check_virustotal(domain):
+    url = f"https://www.virustotal.com/api/v3/domains/{domain}"
+    headers = {"x-apikey": VT_API_KEY}
+
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        data = response.json()
+
+        if response.status_code == 200:
+            last_analysis_stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            return {
+                "harmless": last_analysis_stats.get("harmless", 0),
+                "malicious": last_analysis_stats.get("malicious", 0),
+                "suspicious": last_analysis_stats.get("suspicious", 0),
+                "undetected": last_analysis_stats.get("undetected", 0),
+            }
+        else:
+            return {"error": f"VirusTotal API error: {response.status_code}"}
+    except requests.RequestException as e:
+        return {"error": f"Request failed: {e}"}
+
+
 def scan_http_headers(url):
-    """Retrieve HTTP headers from the target URL."""
     try:
         response = requests.get(url, timeout=5)
-        return response.headers
+        return dict(response.headers)  # Convert CaseInsensitiveDict to a normal dict
     except requests.RequestException as e:
         return {"error": f"HTTP request failed: {e}"}
 
 
-def scan_subdomains(domain_name, subdomains):
-    """Scan for active subdomains in parallel."""
+def load_subdomains(file_path="../files/subdomainslist.txt"):
+    if not os.path.exists(file_path):
+        print(f"[-] Warning: Subdomain file {file_path} not found.")
+        return []
+    try:
+        with open(file_path, "r") as file:
+            return [line.strip() for line in file.readlines()]
+    except Exception as e:
+        print(f"[-] Error reading subdomains file: {e}")
+        return []
 
+
+def scan_subdomains(domain_name, subdomains):
     def check_subdomain(subdomain):
         url = f"https://{subdomain}.{domain_name}"
         try:
@@ -97,41 +118,57 @@ def scan_subdomains(domain_name, subdomains):
 
 
 def fetch_subdomains_crt(domain):
-    """Retrieve subdomains from crt.sh"""
     url = f"https://crt.sh/?q={domain}&output=json"
     try:
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             data = response.json()
-            return list(set(entry['name_value'] for entry in data))
-    except requests.RequestException as e:
-        return {"error": f"crt.sh request failed: {e}"}
+            return list(set(entry.get('name_value', '') for entry in data if 'name_value' in entry))
+    except requests.RequestException:
+        print("[-] Failed to retrieve subdomains from crt.sh")
+        return []
     return []
 
 
+def save_results_to_json(target, data):
+    filename = f"{target}_osint_results.json"
+    try:
+        with open(filename, "w") as json_file:
+            json.dump(data, json_file, indent=4)
+        print(f"[+] Report saved as {filename}")
+    except IOError as e:
+        print(f"[-] Failed to save JSON file: {e}")
+
+
 def main(target):
-    """Run the full OSINT scan on a target domain."""
     print(f"[+] Scanning {target}...")
 
     whois_info = whois_check(target)
     headers_info = scan_http_headers(f"https://{target}")
     crt_subdomains = fetch_subdomains_crt(target)
+    vt_info = check_virustotal(target)
 
-    subdomains_to_check = ["www", "mail", "ftp", "blog", "admin", "secure", "test"] + crt_subdomains
+    subdomain_file = "../files/subdomainslist.txt"
+    subdomains_from_file = load_subdomains(subdomain_file)
+    subdomains_to_check = list(set(subdomains_from_file + crt_subdomains))
+
     active_subdomains = scan_subdomains(target, subdomains_to_check)
 
     report = {
         "WHOIS": whois_info,
+        "VirusTotal": vt_info,
         "HTTP Headers": headers_info,
         "Subdomains": active_subdomains,
     }
 
-    print(report)
-    return report
+    save_results_to_json(target, report)
 
 
 if __name__ == "__main__":
     domain_input = input("Enter domain: ")
     main(domain_input)
+
+
+
 
 
